@@ -349,9 +349,9 @@ class Grid:
         clockwise=False,
         waves_coming_from=True,
     ):
-        self._freq = np.asarray_chkfinite(freq).copy()
-        self._dirs = np.asarray_chkfinite(dirs).copy()
-        self._vals = np.asarray_chkfinite(vals).copy()
+        self._freq = np.asarray_chkfinite(freq).copy()  # [rad/s]
+        self._dirs = np.asarray_chkfinite(dirs).copy()  # [rad]
+        self._vals = np.asarray_chkfinite(vals).copy()  # [xxx/(rad^2/s)]
         self._clockwise = clockwise
         self._waves_coming_from = waves_coming_from
         self._freq_hz = freq_hz
@@ -621,7 +621,11 @@ class Grid:
         elif complex_convert.lower() == "polar":
             amp, phase = complex_to_polar(zp, phase_degrees=False)
             interp_amp = interp2d(xp, yp, amp, **kw)
-            interp_phase = interp2d(xp, yp, phase, **kw)
+
+            # Note: phase interpolation is not "unwraped"
+            phase_uw = np.unwrap(phase, period=2 * np.pi)
+
+            interp_phase = interp2d(xp, yp, phase_uw, **kw)
             return lambda *args, **kwargs: (
                 polar_to_complex(
                     interp_amp(*args, **kwargs),
@@ -774,7 +778,7 @@ class Grid:
         new._freq, new._dirs, new._vals = freq_new, dirs_new, vals_new
         return new
 
-    def bandpassed(self, freq_min = None, freq_max = None):
+    def bandpassed(self, freq_min=None, freq_max=None):
         """
         Apply a bandpass filter to keep only the energy between the given frequencies [Hz].
 
@@ -792,21 +796,20 @@ class Grid:
             freq_max = max(freq_hz)
 
         assert freq_min < freq_max, "freq_min must be less than freq_max"
-        assert freq_min >= min(freq_hz), "freq_min must be greater than or equal to the minimum frequency in the grid"
-        assert freq_max <= max(freq_hz), "freq_max must be less than or equal to the maximum frequency in the grid"
+        assert freq_min >= min(
+            freq_hz
+        ), "freq_min must be greater than or equal to the minimum frequency in the grid"
+        assert freq_max <= max(
+            freq_hz
+        ), "freq_max must be less than or equal to the maximum frequency in the grid"
 
         new_freq = np.unique([*freq_hz, freq_min, freq_max])
         new_freq.sort()
         new_freq = new_freq[(new_freq >= freq_min) & (new_freq <= freq_max)]
 
-        return self.reshape(freq = new_freq,
-                            dirs = self.dirs(degrees=True),
-                            freq_hz = True,
-                            degrees = True)
-
-
-
-
+        return self.reshape(
+            freq=new_freq, dirs=self.dirs(degrees=True), freq_hz=True, degrees=True
+        )
 
     def __mul__(self, other):
         """
@@ -1233,13 +1236,26 @@ class DirectionalSpectrum(DisableComplexMixin, Grid):
         if freq_hz:
             self._vals = 1.0 / (2.0 * np.pi) * self._vals
 
-        if degrees:
-            self._vals = 180.0 / np.pi * self._vals
+        if not self.isoned:
+            if degrees:
+                self._vals = 180.0 / np.pi * self._vals
 
         if np.any(np.iscomplex(self._vals)):
             raise ValueError("Spectrum values can not be complex.")
         elif np.any(self._vals < 0.0):
             raise ValueError("Spectrum values must be positive.")
+
+    @property
+    def isoned(self):
+        """
+        Check if the spectrum is a 1-D spectrum. This is the case when only a single direction is defined
+
+        Returns
+        -------
+        bool :
+            ``True`` if the spectrum is a 1-D spectrum, and ``False`` otherwise.
+        """
+        return self._dirs.shape[0] == 1
 
     @classmethod
     def from_spectrum1d(
@@ -1468,6 +1484,16 @@ class DirectionalSpectrum(DisableComplexMixin, Grid):
         if freq_hz is None:
             freq_hz = self._freq_hz
 
+        if self.isoned:
+
+            f = self._freq.copy()
+            v = self._vals.copy().flatten()
+
+            if freq_hz:
+                return f / (2.0 * np.pi),  (2.0 * np.pi) * v
+            else:
+                return f, v
+
         if axis == 1:
             degrees = False
         elif degrees is None:
@@ -1652,6 +1678,7 @@ class WaveSpectrum(DirectionalSpectrum):
         spectrum : array-like
             1-D spectrum directional distribution.
         """
+
         sin = trapezoid(np.sin(dirs) * spectrum, dirs)
         cos = trapezoid(np.cos(dirs) * spectrum, dirs)
         return _robust_modulus(np.arctan2(sin, cos), 2.0 * np.pi)
