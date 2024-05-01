@@ -399,7 +399,8 @@ class Grid:
         """
         if np.any(freq[:-1] >= freq[1:]) or freq[0] < 0:
             raise ValueError(
-                "Frequencies must be positive and monotonically increasing."
+                "Frequencies must be positive and monotonically increasing.\n"
+                f"Got: {freq}"
             )
 
     def _check_dirs(self, dirs):
@@ -409,7 +410,8 @@ class Grid:
         if np.any(dirs[:-1] >= dirs[1:]) or dirs[0] < 0 or dirs[-1] >= 2.0 * np.pi:
             raise ValueError(
                 "Directions must be positive, monotonically increasing, and "
-                "be [0., 360.) degs (or [0., 2*pi) rads)."
+                "be [0., 360.) degs (or [0., 2*pi) rads).\n"
+                f"Got provided {dirs}"
             )
 
     def freq(self, freq_hz=None):
