@@ -4,7 +4,7 @@ from numbers import Number
 
 import numpy as np
 from scipy.integrate import trapezoid
-from scipy.interpolate import interp2d
+from scipy.interpolate import interp2d, LinearNDInterpolator
 from scipy.special import gamma
 
 
@@ -813,6 +813,94 @@ class Grid:
             freq=new_freq, dirs=self.dirs(degrees=True), freq_hz=True, degrees=True
         )
 
+    def encounter(
+        self, sailing_direction: float, sailing_velocity: float, waterdepth: float = 0
+    ):
+        """
+        Calculates the encounter spectrum for a given sailing direction and velocity.
+        """
+
+        if waterdepth > 0:
+            raise NotImplementedError(
+                "Waterdepth is not yet supported, only deep-water (<=0) is implemented"
+            )
+
+        # get the grid
+        freq = self.freq(freq_hz=True)
+        dirs = self.dirs(degrees=True)
+        vals = self._vals
+
+        # treat opposite directions as negative frequencies
+        ddir = dirs[dirs < 180]
+        for d in ddir:
+            # assert d+180 in dirs, f"Direction {d} is missing its opposite direction {d+180}" # fails
+            assert (
+                min(abs(dirs - (d + 180))) < 1e-6
+            ), f"Direction {d} is missing its opposite direction {d+180}"
+
+        assert len(dirs) == 2 * len(
+            ddir
+        ), "Directions must be defined in pairs separated by 180 degrees"
+        nd = len(ddir)
+        nf = len(freq)
+
+        dfreq = np.zeros((2 * nf, nd))
+        dvals = np.zeros((2 * nf, nd))
+        ddirs = np.zeros((2 * nf, nd))
+
+        omega = 2 * np.pi * freq
+
+        for i in range(len(ddir)):
+            S = vals[:, i]
+
+            velocity_in_direction = sailing_velocity * np.cos(
+                np.deg2rad(sailing_direction - dirs[i])
+            )
+
+            omega_e = omega - omega**2 * velocity_in_direction / 9.81
+            S_e = S / (1 - (2 * omega * velocity_in_direction / 9.81))
+
+            dfreq[:nf,i] = (omega_e / (2 * np.pi))[::-1]
+            dvals[:nf,i] = S_e[::-1]
+            ddirs[:,i] = dirs[i]
+
+            # the opposite direction
+            S = vals[:, i + nd]
+            velocity_in_direction = sailing_velocity * np.cos(
+                np.deg2rad(sailing_direction - dirs[i + nd])
+            )
+
+            omega_e = omega - omega**2 * velocity_in_direction / 9.81
+            S_e = S / (1 - (2 * omega * velocity_in_direction / 9.81))
+
+            dfreq[nf:, i] = -omega_e / (2 * np.pi)
+            dvals[nf:, i] = S_e
+
+
+        # verify that all grid-points are unique
+        test = zip(ddirs.flat, dfreq.flat)
+        assert len(set(test)) == len(ddirs.flat), "Not all grid points are unique"
+
+        # make an interpolation function for the new grid
+        f = LinearNDInterpolator(
+            (ddirs.flat, dfreq.flat), dvals.flat, fill_value=0.0
+        )
+
+        # fill the new original grid with the interpolated values
+        # expand ddir such that its second dimension has the length of freq
+        ddir_exp = np.tile(ddir, (nf, 1))
+        freq_exp = np.tile(freq, (nd, 1)).T
+
+        vals_new_left = f(ddir_exp, freq_exp)
+        vals_new_right = f(ddir_exp, -freq_exp)
+        vals_new = np.concatenate((vals_new_left, vals_new_right), axis=1)
+
+        assert (
+            self._vals.shape == vals_new.shape
+        ), "The new grid must have the same shape as the original grid"
+
+        self._vals = vals_new
+
     def __mul__(self, other):
         """
         Multiply values (element-wise).
@@ -1487,12 +1575,11 @@ class DirectionalSpectrum(DisableComplexMixin, Grid):
             freq_hz = self._freq_hz
 
         if self.isoned:
-
             f = self._freq.copy()
             v = self._vals.copy().flatten()
 
             if freq_hz:
-                return f / (2.0 * np.pi),  (2.0 * np.pi) * v
+                return f / (2.0 * np.pi), (2.0 * np.pi) * v
             else:
                 return f, v
 
