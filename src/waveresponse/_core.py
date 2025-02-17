@@ -349,9 +349,9 @@ class Grid:
         clockwise=False,
         waves_coming_from=True,
     ):
-        self._freq = np.asarray_chkfinite(freq).copy()
-        self._dirs = np.asarray_chkfinite(dirs).copy()
-        self._vals = np.asarray_chkfinite(vals).copy()
+        self._freq = np.asarray_chkfinite(freq).copy()  # [rad/s]
+        self._dirs = np.asarray_chkfinite(dirs).copy()  # [rad]
+        self._vals = np.asarray_chkfinite(vals).copy()  # [xxx/(rad^2/s)]
         self._clockwise = clockwise
         self._waves_coming_from = waves_coming_from
         self._freq_hz = freq_hz
@@ -399,7 +399,8 @@ class Grid:
         """
         if np.any(freq[:-1] >= freq[1:]) or freq[0] < 0:
             raise ValueError(
-                "Frequencies must be positive and monotonically increasing."
+                "Frequencies must be positive and monotonically increasing.\n"
+                f"Got: {freq}"
             )
 
     def _check_dirs(self, dirs):
@@ -409,7 +410,8 @@ class Grid:
         if np.any(dirs[:-1] >= dirs[1:]) or dirs[0] < 0 or dirs[-1] >= 2.0 * np.pi:
             raise ValueError(
                 "Directions must be positive, monotonically increasing, and "
-                "be [0., 360.) degs (or [0., 2*pi) rads)."
+                "be [0., 360.) degs (or [0., 2*pi) rads).\n"
+                f"Got provided {dirs}"
             )
 
     def freq(self, freq_hz=None):
@@ -622,7 +624,8 @@ class Grid:
         elif complex_convert.lower() == "polar":
             amp, phase = complex_to_polar(zp, phase_degrees=False)
             interp_amp = RGI((xp, yp), amp.T, **kw)
-            interp_phase = RGI((xp, yp), phase.T, **kw)
+            phase_uw = np.unwrap(phase, period=2 * np.pi)
+            interp_phase = RGI((xp, yp), phase_uw.T, **kw)
             return lambda *args, **kwargs: (
                 polar_to_complex(
                     interp_amp(*args, **kwargs),
@@ -778,6 +781,127 @@ class Grid:
         new = self.copy()
         new._freq, new._dirs, new._vals = freq_new, dirs_new, vals_new
         return new
+
+    def bandpassed(self, freq_min=None, freq_max=None):
+        """
+        Apply a bandpass filter to keep only the energy between the given frequencies [Hz].
+
+        A new object is returned where the grid is modified such that
+        - the bandpassed frequencies are included
+        - the frequencies outside the bandpass are removed
+
+        """
+
+        freq_hz = self.freq(freq_hz=True)
+
+        if freq_min is None:
+            freq_min = min(freq_hz)
+        if freq_max is None:
+            freq_max = max(freq_hz)
+
+        assert freq_min < freq_max, "freq_min must be less than freq_max"
+        assert freq_min >= min(
+            freq_hz
+        ), "freq_min must be greater than or equal to the minimum frequency in the grid"
+        assert freq_max <= max(
+            freq_hz
+        ), "freq_max must be less than or equal to the maximum frequency in the grid"
+
+        new_freq = np.unique([*freq_hz, freq_min, freq_max])
+        new_freq.sort()
+        new_freq = new_freq[(new_freq >= freq_min) & (new_freq <= freq_max)]
+
+        return self.reshape(
+            freq=new_freq, dirs=self.dirs(degrees=True), freq_hz=True, degrees=True
+        )
+
+    def encounter(
+        self, sailing_direction: float, sailing_velocity: float, waterdepth: float = 0
+    ):
+        """
+        Calculates the encounter spectrum for a given sailing direction and velocity.
+        """
+
+        if waterdepth > 0:
+            raise NotImplementedError(
+                "Waterdepth is not yet supported, only deep-water (<=0) is implemented"
+            )
+
+        # get the grid
+        freq = self.freq(freq_hz=True)
+        dirs = self.dirs(degrees=True)
+        vals = self._vals
+
+        # treat opposite directions as negative frequencies
+        ddir = dirs[dirs < 180]
+        for d in ddir:
+            # assert d+180 in dirs, f"Direction {d} is missing its opposite direction {d+180}" # fails
+            assert (
+                min(abs(dirs - (d + 180))) < 1e-6
+            ), f"Direction {d} is missing its opposite direction {d+180}"
+
+        assert len(dirs) == 2 * len(
+            ddir
+        ), "Directions must be defined in pairs separated by 180 degrees"
+        nd = len(ddir)
+        nf = len(freq)
+
+        dfreq = np.zeros((2 * nf, nd))
+        dvals = np.zeros((2 * nf, nd))
+        ddirs = np.zeros((2 * nf, nd))
+
+        omega = 2 * np.pi * freq
+
+        for i in range(len(ddir)):
+            S = vals[:, i]
+
+            velocity_in_direction = sailing_velocity * np.cos(
+                np.deg2rad(sailing_direction - dirs[i])
+            )
+
+            omega_e = omega - omega**2 * velocity_in_direction / 9.81
+            S_e = S / (1 - (2 * omega * velocity_in_direction / 9.81))
+
+            dfreq[:nf,i] = (omega_e / (2 * np.pi))[::-1]
+            dvals[:nf,i] = S_e[::-1]
+            ddirs[:,i] = dirs[i]
+
+            # the opposite direction
+            S = vals[:, i + nd]
+            velocity_in_direction = sailing_velocity * np.cos(
+                np.deg2rad(sailing_direction - dirs[i + nd])
+            )
+
+            omega_e = omega - omega**2 * velocity_in_direction / 9.81
+            S_e = S / (1 - (2 * omega * velocity_in_direction / 9.81))
+
+            dfreq[nf:, i] = -omega_e / (2 * np.pi)
+            dvals[nf:, i] = S_e
+
+
+        # verify that all grid-points are unique
+        test = zip(ddirs.flat, dfreq.flat)
+        assert len(set(test)) == len(ddirs.flat), "Not all grid points are unique"
+
+        # make an interpolation function for the new grid
+        f = LinearNDInterpolator(
+            (ddirs.flat, dfreq.flat), dvals.flat, fill_value=0.0
+        )
+
+        # fill the new original grid with the interpolated values
+        # expand ddir such that its second dimension has the length of freq
+        ddir_exp = np.tile(ddir, (nf, 1))
+        freq_exp = np.tile(freq, (nd, 1)).T
+
+        vals_new_left = f(ddir_exp, freq_exp)
+        vals_new_right = f(ddir_exp, -freq_exp)
+        vals_new = np.concatenate((vals_new_left, vals_new_right), axis=1)
+
+        assert (
+            self._vals.shape == vals_new.shape
+        ), "The new grid must have the same shape as the original grid"
+
+        self._vals = vals_new
 
     def __mul__(self, other):
         """
@@ -1204,13 +1328,26 @@ class DirectionalSpectrum(DisableComplexMixin, Grid):
         if freq_hz:
             self._vals = 1.0 / (2.0 * np.pi) * self._vals
 
-        if degrees:
-            self._vals = 180.0 / np.pi * self._vals
+        if not self.isoned:
+            if degrees:
+                self._vals = 180.0 / np.pi * self._vals
 
         if np.any(np.iscomplex(self._vals)):
             raise ValueError("Spectrum values can not be complex.")
         elif np.any(self._vals < 0.0):
             raise ValueError("Spectrum values must be positive.")
+
+    @property
+    def isoned(self):
+        """
+        Check if the spectrum is a 1-D spectrum. This is the case when only a single direction is defined
+
+        Returns
+        -------
+        bool :
+            ``True`` if the spectrum is a 1-D spectrum, and ``False`` otherwise.
+        """
+        return self._dirs.shape[0] == 1
 
     @classmethod
     def from_spectrum1d(
@@ -1439,6 +1576,15 @@ class DirectionalSpectrum(DisableComplexMixin, Grid):
         if freq_hz is None:
             freq_hz = self._freq_hz
 
+        if self.isoned:
+            f = self._freq.copy()
+            v = self._vals.copy().flatten()
+
+            if freq_hz:
+                return f / (2.0 * np.pi), (2.0 * np.pi) * v
+            else:
+                return f, v
+
         if axis == 1:
             degrees = False
         elif degrees is None:
@@ -1623,6 +1769,7 @@ class WaveSpectrum(DirectionalSpectrum):
         spectrum : array-like
             1-D spectrum directional distribution.
         """
+
         sin = trapezoid(np.sin(dirs) * spectrum, dirs)
         cos = trapezoid(np.cos(dirs) * spectrum, dirs)
         return _robust_modulus(np.arctan2(sin, cos), 2.0 * np.pi)
